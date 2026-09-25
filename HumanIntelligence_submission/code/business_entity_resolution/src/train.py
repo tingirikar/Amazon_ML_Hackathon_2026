@@ -1,12 +1,11 @@
-"""High-Speed Multiprocessing Training Pipeline: Blocker Hard Negatives + LightGBM + Vectorized Macro F0.5.
+"""High-Speed Memory-Optimized Training Pipeline: Blocker Hard Negatives + LightGBM + Vectorized Macro F0.5.
 
-Key Innovations
----------------
-1. Multi-Core Parallel Mining: Distributes S1 entity blocker queries and feature extraction
-   across all available CPU cores using multiprocessing (with native zero-copy fork on Linux).
-2. Blocker Hard Negative Mining: Mines realistic co-located/address imposters from the blocker,
-   teaching LightGBM the exact boundary needed for 98%+ precision.
-3. Vectorized Validation Scoring: Evaluates all validation candidates in a single batch C++ call.
+Memory & Speed Optimizations
+----------------------------
+1. Compact Float32 Storage: Features are packed into contiguous float32 numpy arrays (88 bytes/pair
+   instead of ~600 bytes with Python list objects), slashing RAM usage by 7x.
+2. Controlled Worker Count: Uses 4 CPU worker processes to prevent memory pressure on 8GB/16GB cloud VMs.
+3. Fast Vectorized Validation: Batch predicts all validation pairs in a single C++ call.
 """
 
 import os
@@ -29,7 +28,7 @@ from matcher import (extract_pairwise_features, select_matches,
 BASE_DIR = "6ab10eb3b23ba_student_resource/student_resource"
 TRAIN_DIR = os.path.join(BASE_DIR, "dataset", "train")
 
-# Global context dictionary for worker processes
+# Global worker context for multiprocessing
 _worker_ctx = {}
 
 
@@ -48,7 +47,7 @@ def _init_worker(blockers, s1_data, s1_raw, cand_data, match_map, train_id_set, 
 
 
 def _process_chunk(s1_keys_chunk):
-    """Worker task: extract candidate pairs and features for a chunk of S1 entities."""
+    """Worker task: extract candidate pairs with compact float32 encoding."""
     blockers = _worker_ctx['blockers']
     s1_data = _worker_ctx['s1_data']
     s1_raw = _worker_ctx['s1_raw']
@@ -57,8 +56,8 @@ def _process_chunk(s1_keys_chunk):
     train_id_set = _worker_ctx['train_id_set']
     neg_rate = _worker_ctx['neg_rate']
 
-    local_X = []
-    local_y = []
+    local_X_list = []
+    local_y_list = []
     local_pos = 0
     local_neg = 0
     local_val_candidates = {}
@@ -93,17 +92,17 @@ def _process_chunk(s1_keys_chunk):
 
             if is_train:
                 if label == 1:
-                    local_X.append(feats)
-                    local_y.append(1)
+                    local_X_list.append(feats)
+                    local_y_list.append(1)
                     local_pos += 1
                 elif label == 0 and random.random() < neg_rate:
-                    local_X.append(feats)
-                    local_y.append(0)
+                    local_X_list.append(feats)
+                    local_y_list.append(0)
                     local_neg += 1
             else:
-                cands_for_eval.append((cand_id, feats))
+                cands_for_eval.append((cand_id, np.array(feats, dtype=np.float32)))
 
-        # Add true matches missed by blocker so positive distribution is fully learned
+        # Add true matches missed by blocker
         for tid in true_ids:
             if tid not in found_ids and tid in cand_data:
                 c_proc = cand_data[tid]
@@ -115,16 +114,20 @@ def _process_chunk(s1_keys_chunk):
                     s1_non_ascii=s1[6], c_non_ascii=c_proc[6],
                 )
                 if is_train:
-                    local_X.append(feats)
-                    local_y.append(1)
+                    local_X_list.append(feats)
+                    local_y_list.append(1)
                     local_pos += 1
                 else:
-                    cands_for_eval.append((tid, feats))
+                    cands_for_eval.append((tid, np.array(feats, dtype=np.float32)))
 
         if not is_train:
             local_val_candidates[s1_id] = cands_for_eval
 
-    return local_X, local_y, local_pos, local_neg, local_val_candidates
+    # Convert to compact numpy arrays before crossing process boundary
+    X_arr = np.array(local_X_list, dtype=np.float32) if local_X_list else np.empty((0, NUM_FEATURES), dtype=np.float32)
+    y_arr = np.array(local_y_list, dtype=np.int8) if local_y_list else np.empty(0, dtype=np.int8)
+
+    return X_arr, y_arr, local_pos, local_neg, local_val_candidates
 
 
 def _process_record(parts):
@@ -170,25 +173,22 @@ def compute_macro_f05(pred_map, true_map, beta=0.5):
     return float(np.mean(f_scores))
 
 
-def train_pipeline(num_s1_samples=200000):
-    """High-speed multi-core training pipeline."""
+def train_pipeline(num_s1_samples=100000):
+    """High-speed memory-optimized training pipeline."""
     random.seed(42)
     np.random.seed(42)
     t0 = time.time()
 
-    label = "ALL" if num_s1_samples <= 0 else f"{num_s1_samples:,}"
+    label = f"{num_s1_samples:,}"
     print("=" * 75)
-    print(f"Training LightGBM Matcher on {label} Reference Entities [MULTI-CORE ACCELERATED]...")
+    print(f"Training LightGBM Matcher on {label} Reference Entities [MEMORY-OPTIMIZED]...")
     print("  Mining HARD NEGATIVES from Blocker | Macro F0.5 Optimization")
     print("=" * 75)
 
     # ------------------------------------------------------------------ 1. GT
     print("\n[1/6] Reading ground truth...")
     gt_path = os.path.join(TRAIN_DIR, "train_ground_truth.tsv")
-    if num_s1_samples > 0:
-        df_gt = pd.read_csv(gt_path, sep="\t", nrows=num_s1_samples)
-    else:
-        df_gt = pd.read_csv(gt_path, sep="\t")
+    df_gt = pd.read_csv(gt_path, sep="\t", nrows=num_s1_samples)
 
     match_map = {}
     for _, row in df_gt.iterrows():
@@ -237,8 +237,8 @@ def train_pipeline(num_s1_samples=200000):
                     continue
                 cid = parts[0]
                 country = parts[3] if len(parts) > 3 else "US"
-                # Keep true matches + 1 in 4 sample for realistic hard negative distribution
-                if cid in all_target_ids or (i % 4 == 0):
+                # Keep true matches + 1 in 5 sample to keep RAM lightweight
+                if cid in all_target_ids or (i % 5 == 0):
                     rec = _process_record(parts)
                     cand_data[cid] = rec
                     batch[country].append((cid, parts[1] if len(parts) > 1 else "",
@@ -255,21 +255,22 @@ def train_pipeline(num_s1_samples=200000):
         blocker_by_country[c].prune_frequent_tokens()
         print(f"  Country [{c}] Blocker ready: {len(blocker_by_country[c].records):,} indexed records")
 
-    # ------------------------------------------------------------------ 4. Mining (Parallel)
+    # ------------------------------------------------------------------ 4. Mining (Parallel & Lean)
     print("\n[4/6] Mining Hard Negatives from Blocker & building feature pairs [PARALLEL]...")
     s1_keys = list(s1_data.keys())
     train_ids, val_ids = train_test_split(s1_keys, test_size=0.15, random_state=42)
     train_id_set = set(train_ids)
 
-    n_workers = min(16, max(1, os.cpu_count() or 4))
-    print(f"  Spawning {n_workers} parallel CPU workers across {len(s1_keys):,} entities...")
+    # Use 4 workers to stay well within 8GB/16GB memory bounds
+    n_workers = min(4, max(1, os.cpu_count() or 2))
+    print(f"  Running {n_workers} CPU workers with compact float32 encoding...")
 
-    chunk_size = max(500, len(s1_keys) // (n_workers * 4))
+    chunk_size = max(500, len(s1_keys) // (n_workers * 6))
     chunks = [s1_keys[i : i + chunk_size] for i in range(0, len(s1_keys), chunk_size)]
 
     ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context("spawn")
 
-    X, y = [], []
+    X_chunks, y_chunks = [], []
     pos_count = neg_count = 0
     val_candidates = {}
 
@@ -284,14 +285,15 @@ def train_pipeline(num_s1_samples=200000):
             cand_data,
             match_map,
             train_id_set,
-            0.50,
+            0.45,
         ),
     ) as pool:
         processed_chunks = 0
         total_entities_processed = 0
-        for l_x, l_y, l_pos, l_neg, l_val in pool.imap_unordered(_process_chunk, chunks):
-            X.extend(l_x)
-            y.extend(l_y)
+        for x_arr, y_arr, l_pos, l_neg, l_val in pool.imap_unordered(_process_chunk, chunks):
+            if len(x_arr) > 0:
+                X_chunks.append(x_arr)
+                y_chunks.append(y_arr)
             pos_count += l_pos
             neg_count += l_neg
             val_candidates.update(l_val)
@@ -302,8 +304,13 @@ def train_pipeline(num_s1_samples=200000):
                 rate = total_entities_processed / max(time.time() - mining_t0, 0.01)
                 print(f"    Progress: {pct:.1f}% ({total_entities_processed:,}/{len(s1_keys):,} entities | {rate:.0f} ent/s)")
 
+    # Concatenate compact numpy arrays
+    X = np.concatenate(X_chunks, axis=0) if X_chunks else np.empty((0, NUM_FEATURES), dtype=np.float32)
+    y = np.concatenate(y_chunks, axis=0) if y_chunks else np.empty(0, dtype=np.int8)
+    del X_chunks, y_chunks
+
     print(f"  Generated {len(X):,} training pairs in {time.time() - mining_t0:.1f}s | "
-          f"Positives: {pos_count:,} | Hard Negatives: {neg_count:,}")
+          f"RAM used: {X.nbytes / (1024*1024):.1f} MB | Positives: {pos_count:,} | Hard Negatives: {neg_count:,}")
 
     # ------------------------------------------------------------------ 5. Train
     print("\n[5/6] Training LightGBM model on blocker hard negatives...")
@@ -324,10 +331,13 @@ def train_pipeline(num_s1_samples=200000):
 
     val_scored = defaultdict(list)
     if all_val_feats:
-        print(f"  Running batch inference on {len(all_val_feats):,} validation pairs...")
-        all_probs = matcher.predict_matches(all_val_feats)
+        val_matrix = np.array(all_val_feats, dtype=np.float32)
+        del all_val_feats
+        print(f"  Running batch inference on {len(val_matrix):,} validation pairs...")
+        all_probs = matcher.predict_matches(val_matrix)
         for (sid, cid), prob in zip(val_meta, all_probs):
             val_scored[sid].append((cid, float(prob), None))
+        del val_matrix
 
     # Grid search threshold to maximize official competition Macro F0.5
     best_f05, best_thresh = 0.0, 0.75
