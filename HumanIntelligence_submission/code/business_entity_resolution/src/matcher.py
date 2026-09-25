@@ -231,9 +231,9 @@ class EntityMatcher:
 
     def predict_matches(self, feature_rows):
         """Run batch inference. Returns array of match probabilities."""
-        if not feature_rows:
+        if feature_rows is None or len(feature_rows) == 0:
             return np.array([])
-        X = np.array(feature_rows)
+        X = feature_rows if isinstance(feature_rows, np.ndarray) else np.array(feature_rows)
         if self.model is not None:
             return self.model.predict(X)
         else:
