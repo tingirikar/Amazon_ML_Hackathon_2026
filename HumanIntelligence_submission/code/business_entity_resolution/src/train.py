@@ -1,17 +1,19 @@
-"""Training pipeline: Blocker Hard Negative Mining + LightGBM + Macro F0.5 Optimization.
+"""High-Speed Multiprocessing Training Pipeline: Blocker Hard Negatives + LightGBM + Vectorized Macro F0.5.
 
-Key Innovation
---------------
-Instead of training on random negatives (which tricks the model into thinking any
-candidate sharing an address word is a match), this pipeline mines HARD NEGATIVES
-directly from the 4-channel blocker. This teaches LightGBM to distinguish true business
-merges from co-located stores and address imposters, delivering 98%+ precision.
+Key Innovations
+---------------
+1. Multi-Core Parallel Mining: Distributes S1 entity blocker queries and feature extraction
+   across all available CPU cores using multiprocessing (with native zero-copy fork on Linux).
+2. Blocker Hard Negative Mining: Mines realistic co-located/address imposters from the blocker,
+   teaching LightGBM the exact boundary needed for 98%+ precision.
+3. Vectorized Validation Scoring: Evaluates all validation candidates in a single batch C++ call.
 """
 
 import os
 import sys
 import time
 import random
+import multiprocessing as mp
 from collections import defaultdict
 import numpy as np
 import pandas as pd
@@ -19,17 +21,114 @@ from sklearn.model_selection import train_test_split
 
 sys.path.append(os.path.dirname(__file__))
 from preprocess import (clean_ascii, clean_unicode, extract_core_name,
-                        extract_tokens, extract_digits, has_non_ascii)
+                        extract_digits, has_non_ascii)
 from blocking import CandidateBlocker
-from matcher import (extract_pairwise_features, is_plausible_match,
-                     select_matches, EntityMatcher, NUM_FEATURES)
+from matcher import (extract_pairwise_features, select_matches,
+                     EntityMatcher, NUM_FEATURES)
 
 BASE_DIR = "6ab10eb3b23ba_student_resource/student_resource"
 TRAIN_DIR = os.path.join(BASE_DIR, "dataset", "train")
 
+# Global context dictionary for worker processes
+_worker_ctx = {}
+
+
+def _init_worker(blockers, s1_data, s1_raw, cand_data, match_map, train_id_set, neg_rate):
+    """Initialize read-only memory structures inside worker process."""
+    global _worker_ctx
+    _worker_ctx = {
+        'blockers': blockers,
+        's1_data': s1_data,
+        's1_raw': s1_raw,
+        'cand_data': cand_data,
+        'match_map': match_map,
+        'train_id_set': train_id_set,
+        'neg_rate': neg_rate,
+    }
+
+
+def _process_chunk(s1_keys_chunk):
+    """Worker task: extract candidate pairs and features for a chunk of S1 entities."""
+    blockers = _worker_ctx['blockers']
+    s1_data = _worker_ctx['s1_data']
+    s1_raw = _worker_ctx['s1_raw']
+    cand_data = _worker_ctx['cand_data']
+    match_map = _worker_ctx['match_map']
+    train_id_set = _worker_ctx['train_id_set']
+    neg_rate = _worker_ctx['neg_rate']
+
+    local_X = []
+    local_y = []
+    local_pos = 0
+    local_neg = 0
+    local_val_candidates = {}
+
+    for s1_id in s1_keys_chunk:
+        s1 = s1_data[s1_id]
+        s1_name, s1_addr = s1_raw[s1_id]
+        country = s1[7]
+        true_ids = match_map[s1_id]
+        is_train = s1_id in train_id_set
+
+        blocker = blockers.get(country)
+        cands = blocker.get_candidates(s1_name, s1_addr) if blocker else []
+
+        found_ids = set()
+        cands_for_eval = []
+
+        for cand_id, cand_rec in cands:
+            found_ids.add(cand_id)
+            c_proc = cand_data.get(cand_id)
+            if not c_proc:
+                continue
+
+            feats = extract_pairwise_features(
+                s1[0], s1[1], s1[2], s1[3],
+                c_proc[0], c_proc[1], c_proc[2], c_proc[3],
+                s1_uname=s1[4], c_uname=c_proc[4],
+                s1_uaddr=s1[5], c_uaddr=c_proc[5],
+                s1_non_ascii=s1[6], c_non_ascii=c_proc[6],
+            )
+            label = 1 if cand_id in true_ids else 0
+
+            if is_train:
+                if label == 1:
+                    local_X.append(feats)
+                    local_y.append(1)
+                    local_pos += 1
+                elif label == 0 and random.random() < neg_rate:
+                    local_X.append(feats)
+                    local_y.append(0)
+                    local_neg += 1
+            else:
+                cands_for_eval.append((cand_id, feats))
+
+        # Add true matches missed by blocker so positive distribution is fully learned
+        for tid in true_ids:
+            if tid not in found_ids and tid in cand_data:
+                c_proc = cand_data[tid]
+                feats = extract_pairwise_features(
+                    s1[0], s1[1], s1[2], s1[3],
+                    c_proc[0], c_proc[1], c_proc[2], c_proc[3],
+                    s1_uname=s1[4], c_uname=c_proc[4],
+                    s1_uaddr=s1[5], c_uaddr=c_proc[5],
+                    s1_non_ascii=s1[6], c_non_ascii=c_proc[6],
+                )
+                if is_train:
+                    local_X.append(feats)
+                    local_y.append(1)
+                    local_pos += 1
+                else:
+                    cands_for_eval.append((tid, feats))
+
+        if not is_train:
+            local_val_candidates[s1_id] = cands_for_eval
+
+    return local_X, local_y, local_pos, local_neg, local_val_candidates
+
 
 def _process_record(parts):
-    """Extract all fields from a TSV line's split parts."""
+    """Extract preprocessed fields from TSV row."""
     name = parts[1] if len(parts) > 1 else ""
     addr = parts[2] if len(parts) > 2 else ""
     country = parts[3] if len(parts) > 3 else ""
@@ -45,24 +144,12 @@ def _process_record(parts):
     )
 
 
-def _make_features(s1, cand):
-    """Build 22-feature vector from two processed records."""
-    return extract_pairwise_features(
-        s1[0], s1[1], s1[2], s1[3],          # ASCII S1
-        cand[0], cand[1], cand[2], cand[3],  # ASCII candidate
-        s1_uname=s1[4], c_uname=cand[4],     # Unicode names
-        s1_uaddr=s1[5], c_uaddr=cand[5],     # Unicode addresses
-        s1_non_ascii=s1[6], c_non_ascii=cand[6],  # Script flags
-    )
-
-
 def compute_macro_f05(pred_map, true_map, beta=0.5):
-    """Compute official competition Macro-Averaged F0.5 across all entities."""
+    """Official competition Macro-Averaged F0.5 metric."""
     f_scores = []
     for s1_id, true_set in true_map.items():
         pred_set = pred_map.get(s1_id, set())
 
-        # Singleton handling
         if not true_set:
             f_scores.append(1.0 if not pred_set else 0.0)
             continue
@@ -83,21 +170,17 @@ def compute_macro_f05(pred_map, true_map, beta=0.5):
     return float(np.mean(f_scores))
 
 
-def train_pipeline(num_s1_samples=0):
-    """Train LightGBM on blocker hard negatives and optimize macro F0.5.
-    
-    Args:
-        num_s1_samples: Number of S1 entities to use. 0 = ALL available.
-    """
+def train_pipeline(num_s1_samples=200000):
+    """High-speed multi-core training pipeline."""
     random.seed(42)
     np.random.seed(42)
     t0 = time.time()
 
-    label = "ALL" if num_s1_samples == 0 else f"{num_s1_samples:,}"
-    print("=" * 70)
-    print(f"Training LightGBM Matcher on {label} Reference Entities...")
+    label = "ALL" if num_s1_samples <= 0 else f"{num_s1_samples:,}"
+    print("=" * 75)
+    print(f"Training LightGBM Matcher on {label} Reference Entities [MULTI-CORE ACCELERATED]...")
     print("  Mining HARD NEGATIVES from Blocker | Macro F0.5 Optimization")
-    print("=" * 70)
+    print("=" * 75)
 
     # ------------------------------------------------------------------ 1. GT
     print("\n[1/6] Reading ground truth...")
@@ -118,9 +201,7 @@ def train_pipeline(num_s1_samples=0):
         all_target_ids.update(ids)
 
     n_singletons = sum(1 for ids in match_map.values() if not ids)
-    print(f"  {len(match_map):,} S1 entities | "
-          f"{len(all_target_ids):,} unique true matches | "
-          f"{n_singletons:,} singletons")
+    print(f"  {len(match_map):,} S1 entities | {len(all_target_ids):,} unique true matches | {n_singletons:,} singletons")
 
     # ------------------------------------------------------------------ 2. S1
     print("\n[2/6] Reading Source 1 records...")
@@ -145,7 +226,6 @@ def train_pipeline(num_s1_samples=0):
         top_k_candidates=50, min_candidate_score=3
     ))
 
-    # Read S2 and S3 (reading positive candidates + pool for blocker)
     for filename in ["train_source2.tsv", "train_source3.tsv"]:
         filepath = os.path.join(TRAIN_DIR, filename)
         with open(filepath, "r", encoding="utf-8") as f:
@@ -157,7 +237,7 @@ def train_pipeline(num_s1_samples=0):
                     continue
                 cid = parts[0]
                 country = parts[3] if len(parts) > 3 else "US"
-                # Keep if true match or sample for realistic blocker pool
+                # Keep true matches + 1 in 4 sample for realistic hard negative distribution
                 if cid in all_target_ids or (i % 4 == 0):
                     rec = _process_record(parts)
                     cand_data[cid] = rec
@@ -175,95 +255,81 @@ def train_pipeline(num_s1_samples=0):
         blocker_by_country[c].prune_frequent_tokens()
         print(f"  Country [{c}] Blocker ready: {len(blocker_by_country[c].records):,} indexed records")
 
-    # ------------------------------------------------------------------ 4. Mining
-    print("\n[4/6] Mining Hard Negatives from Blocker & building feature pairs...")
-    X, y = [], []
-    pos_count = neg_count = 0
-
-    # Split S1 IDs into train and validation splits (85/15)
+    # ------------------------------------------------------------------ 4. Mining (Parallel)
+    print("\n[4/6] Mining Hard Negatives from Blocker & building feature pairs [PARALLEL]...")
     s1_keys = list(s1_data.keys())
     train_ids, val_ids = train_test_split(s1_keys, test_size=0.15, random_state=42)
     train_id_set = set(train_ids)
 
-    val_candidates = {}  # for macro F0.5 optimization
+    n_workers = min(16, max(1, os.cpu_count() or 4))
+    print(f"  Spawning {n_workers} parallel CPU workers across {len(s1_keys):,} entities...")
 
-    for idx, s1_id in enumerate(s1_keys):
-        if idx % 20000 == 0 and idx > 0:
-            print(f"    Processed {idx:,}/{len(s1_keys):,} entities...")
+    chunk_size = max(500, len(s1_keys) // (n_workers * 4))
+    chunks = [s1_keys[i : i + chunk_size] for i in range(0, len(s1_keys), chunk_size)]
 
-        s1 = s1_data[s1_id]
-        s1_name, s1_addr = s1_raw[s1_id]
-        country = s1[7]
-        true_ids = match_map[s1_id]
-        is_train = s1_id in train_id_set
+    ctx = mp.get_context("fork") if hasattr(os, "fork") else mp.get_context("spawn")
 
-        # Query blocker for candidates
-        blocker = blocker_by_country.get(country)
-        cands = blocker.get_candidates(s1_name, s1_addr) if blocker else []
+    X, y = [], []
+    pos_count = neg_count = 0
+    val_candidates = {}
 
-        found_ids = set()
-        cands_for_eval = []
+    mining_t0 = time.time()
+    with ctx.Pool(
+        processes=n_workers,
+        initializer=_init_worker,
+        initargs=(
+            dict(blocker_by_country),
+            s1_data,
+            s1_raw,
+            cand_data,
+            match_map,
+            train_id_set,
+            0.50,
+        ),
+    ) as pool:
+        processed_chunks = 0
+        total_entities_processed = 0
+        for l_x, l_y, l_pos, l_neg, l_val in pool.imap_unordered(_process_chunk, chunks):
+            X.extend(l_x)
+            y.extend(l_y)
+            pos_count += l_pos
+            neg_count += l_neg
+            val_candidates.update(l_val)
+            processed_chunks += 1
+            total_entities_processed += len(chunks[processed_chunks - 1])
+            if processed_chunks % 5 == 0 or processed_chunks == len(chunks):
+                pct = (processed_chunks / len(chunks)) * 100.0
+                rate = total_entities_processed / max(time.time() - mining_t0, 0.01)
+                print(f"    Progress: {pct:.1f}% ({total_entities_processed:,}/{len(s1_keys):,} entities | {rate:.0f} ent/s)")
 
-        # Process blocker candidates
-        for cand_id, cand_rec in cands:
-            found_ids.add(cand_id)
-            c_proc = cand_data.get(cand_id)
-            if not c_proc:
-                continue
-
-            feats = _make_features(s1, c_proc)
-            label = 1 if cand_id in true_ids else 0
-
-            if is_train:
-                if label == 1:
-                    X.append(feats)
-                    y.append(1)
-                    pos_count += 1
-                elif label == 0 and random.random() < 0.50:
-                    X.append(feats)
-                    y.append(0)
-                    neg_count += 1
-            else:
-                cands_for_eval.append((cand_id, feats))
-
-        # Add any true matches that the blocker missed (ensures all positive patterns are learned)
-        for tid in true_ids:
-            if tid not in found_ids and tid in cand_data:
-                c_proc = cand_data[tid]
-                feats = _make_features(s1, c_proc)
-                if is_train:
-                    X.append(feats)
-                    y.append(1)
-                    pos_count += 1
-                else:
-                    cands_for_eval.append((tid, feats))
-
-        if not is_train:
-            val_candidates[s1_id] = cands_for_eval
-
-    print(f"  Generated {len(X):,} training pairs | Positives: {pos_count:,} | Hard Negatives: {neg_count:,}")
+    print(f"  Generated {len(X):,} training pairs in {time.time() - mining_t0:.1f}s | "
+          f"Positives: {pos_count:,} | Hard Negatives: {neg_count:,}")
 
     # ------------------------------------------------------------------ 5. Train
     print("\n[5/6] Training LightGBM model on blocker hard negatives...")
     matcher = EntityMatcher(model_path="models/lgbm_matcher.txt")
     matcher.train_and_save(X, y)
 
-    # ------------------------------------------------------------------ 6. Optimize F0.5
-    print("\n[6/6] Optimizing Macro F0.5 threshold on held-out validation split...")
+    # ------------------------------------------------------------------ 6. Optimize F0.5 (Vectorized)
+    print("\n[6/6] Optimizing Macro F0.5 threshold on held-out validation split [VECTORIZED]...")
     val_true_map = {sid: match_map[sid] for sid in val_ids}
 
-    # Pre-score all validation candidate pairs with model
-    val_scored = {}
+    # Flatten all validation candidate pairs for a single vectorized C++ LightGBM predict call
+    all_val_feats = []
+    val_meta = []
     for sid, cands in val_candidates.items():
-        if not cands:
-            val_scored[sid] = []
-            continue
-        c_ids = [c[0] for c in cands]
-        feat_matrix = [c[1] for c in cands]
-        probs = matcher.predict_matches(feat_matrix)
-        val_scored[sid] = list(zip(c_ids, probs, feat_matrix))
+        for cid, feats in cands:
+            all_val_feats.append(feats)
+            val_meta.append((sid, cid))
 
-    # Fine-grained grid search threshold to maximize official competition Macro F0.5
+    val_scored = defaultdict(list)
+    if all_val_feats:
+        print(f"  Running batch inference on {len(all_val_feats):,} validation pairs...")
+        all_probs = matcher.predict_matches(all_val_feats)
+        for (sid, cid), prob in zip(val_meta, all_probs):
+            val_scored[sid].append((cid, float(prob), None))
+
+    # Grid search threshold to maximize official competition Macro F0.5
     best_f05, best_thresh = 0.0, 0.75
     threshold_candidates = [
         0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70,
