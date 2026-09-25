@@ -1,0 +1,50 @@
+# ==========================================
+# Python & Environment
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.so
+.Python
+
+# ==========================================
+# Large Data Files & Datasets (GitHub 100MB limit)
+# ==========================================
+# Raw dataset archives and files
+dataset/
+**/dataset/
+train/
+test/
+*.tsv
+*.csv
+*.parquet
+*.jsonl
+
+# Output directories containing generated multi-hundred MB TSVs
+output/
+**/output/
+*.zip
+*.tar.gz
+*.7z
+
+# ==========================================
+# Logs & Temporary Files
+# ==========================================
+*.log
+*.tmp
+scratch/
+.system_generated/
+
+# ==========================================
+# IDE & Operating System
+# ==========================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
